@@ -25,7 +25,7 @@ The tool currently checks for:
 ### Installation
 Clone the repository:
 ```bash
-git clone https://github.com/yourusername/rust-sast-tool.git
+git clone https://github.com/geniuskidkanyi/rust-sast-tool.git
 cd rust-sast-tool
 ```
 
