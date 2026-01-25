@@ -3,6 +3,7 @@ use colored::*;
 use regex::Regex;
 use std::fs;
 use walkdir::WalkDir;
+use rayon::prelude::*;
 
 // 1. Define the Command Line Arguments structure
 #[derive(Parser)]
@@ -29,11 +30,22 @@ impl Rule {
         }
     }
 }
+
+// Define struct to hold scan results
+#[derive(Clone)]
+struct Finding{
+    file: String,
+    line_num: usize,
+    rule_name: String,
+    severity: String,
+    code_snippet: String,
+}
+
 fn main() {
     // Parse arguments
     let args = Cli::parse();
 
-    println!("{}", format!("Starting scan on: {}", args.path).blue().bold());
+    println!("{}", format!("Starting scan (parallel) on: {}", args.path).blue().bold());
 
     // Initialize Rules
     // NOTE: In regex, we escape special characters. 
@@ -50,59 +62,80 @@ fn main() {
         Rule::new("Hardcoded Password", r#"password\s*=\s*['"][a-zA-Z0-9@#$%]{6,}['"]"#, "MEDIUM"),
     ];
 
-    // Walk the directory
-    for entry in WalkDir::new(&args.path).into_iter().filter_map(|e| e.ok()) {
-        let path = entry.path();
+    // Parallel walk + scan; collect findings
+    let findings: Vec<Finding> = WalkDir::new(&args.path)
+        .into_iter()
+        .par_bridge() // convert to a parallel iterator
+        .filter_map(|e| e.ok())
+        .filter(|entry| entry.path().is_file())
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .map(|ext| {
+                    let ext_str = ext.to_string_lossy();
+                    ext_str == "php" || ext_str == "js"
+                })
+                .unwrap_or(false)
+        })
+        .map(|entry| {
+            let path_str = entry.path().to_string_lossy().to_string();
+            scan_file_collect(&path_str, &rules)
+        })
+        .flatten()
+        .collect();
 
-        // 1. Check if it's a file (not a directory)
-        if !path.is_file() {
-            continue;
+    // Print in a deterministic, sequential way
+    if findings.is_empty() {
+        println!("{}", "No findings detected.".green().bold());
+    } else {
+        for f in &findings {
+            print_finding(f);
         }
-
-        // 2. Check extensions (PHP or JS)
-        if let Some(extension) = path.extension() {
-            let ext_str = extension.to_string_lossy();
-            if ext_str != "php" && ext_str != "js" {
-                continue; 
-            }
-        } else {
-            continue;
-        }
-
-        // 3. Read the file content
-        // verify_file is a helper function we will write next
-        scan_file(path.to_str().unwrap(), &rules);
+        println!(
+            "{} {}",
+            "Total findings:".bold(),
+            findings.len().to_string().yellow().bold()
+        );
     }
 }
 
 // The function that actually reads the file and checks regex
-fn scan_file(filepath: &str, rules: &Vec<Rule>) {
-    // Try to read the file to a string
+fn scan_file_collect(filepath: &str, rules: &[Rule]) -> Vec<Finding> {
     let content = match fs::read_to_string(filepath) {
         Ok(c) => c,
-        Err(_) => return, // If we can't read it (binary, permissions), just skip
+        Err(_) => return vec![], // Skip unreadable files (binary/permissions)
     };
 
-    // Iterate over lines to give line numbers in report
+    let mut findings = Vec::new();
+
     for (line_num, line) in content.lines().enumerate() {
         for rule in rules {
             if rule.pattern.is_match(line) {
-                print_finding(filepath, line_num + 1, rule, line);
+                findings.push(Finding {
+                    file: filepath.to_string(),
+                    line_num: line_num + 1,
+                    rule_name: rule.name.clone(),
+                    severity: rule.severity.clone(),
+                    code_snippet: line.trim().to_string(),
+                });
             }
         }
     }
+
+    findings
 }
 
 // A simple pretty-printer for our results
-fn print_finding(file: &str, line_num: usize, rule: &Rule, code_snippet: &str) {
-    let color_severity = match rule.severity.as_str() {
+fn print_finding(f: &Finding) {
+    let color_severity = match f.severity.as_str() {
         "CRITICAL" => "CRITICAL".red().bold(),
         "HIGH" => "HIGH".red(),
         _ => "MEDIUM".yellow(),
     };
 
     println!("--------------------------------------------------");
-    println!("{} Found: {}", color_severity, rule.name);
-    println!("File: {}:{}", file, line_num);
-    println!("Code: {}", code_snippet.trim());
+    println!("{} Found: {}", color_severity, f.rule_name);
+    println!("File: {}:{}", f.file, f.line_num);
+    println!("Code: {}", f.code_snippet.trim());
 }
